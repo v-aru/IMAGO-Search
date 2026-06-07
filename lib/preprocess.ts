@@ -2,7 +2,11 @@ import path from "path";
 import fs from "fs";
 import { RawMediaItem, ProcessedMediaItem } from "./types";
 
-// Minimal German+English stop words to reduce noise in the index
+// A minimal bilingual stop-word list covering the most common German and English
+// function words. Removing these reduces the index size and prevents high-frequency
+// words (like "und", "in", "the") from drowning out meaningful terms in scoring.
+// A production system would use a proper NLP tokenizer (e.g. compromise, natural)
+// with a full language-specific stop list.
 const STOP_WORDS = new Set([
   "the", "a", "an", "and", "or", "of", "in", "on", "at", "to", "for",
   "is", "are", "was", "were", "be", "been", "being", "have", "has",
@@ -13,9 +17,10 @@ const STOP_WORDS = new Set([
   "ihr", "ein", "eine", "einer", "eines",
 ]);
 
-/**
- * Parse DD.MM.YYYY → YYYY-MM-DD. Returns empty string if unparseable.
- */
+// Convert DD.MM.YYYY to YYYY-MM-DD so dates are lexicographically sortable and
+// comparable with ISO range inputs from the frontend date picker.
+// Returns empty string on failure so unparseable dates sort to the bottom rather
+// than crashing the request.
 function parseDatum(raw: string): string {
   if (!raw) return "";
   const parts = raw.split(".");
@@ -25,25 +30,27 @@ function parseDatum(raw: string): string {
   return `${yyyy}-${mm.padStart(2, "0")}-${dd.padStart(2, "0")}`;
 }
 
-/**
- * Normalize and tokenize a text string.
- * Lowercases, strips punctuation (except hyphens inside words), removes stop words.
- */
+// Tokenize a free-text string into normalized, indexable terms.
+// - Lowercase for case-insensitive matching
+// - Keep umlauts (ä ö ü ß) because the corpus is mixed German/English
+// - Keep hyphens inside words (e.g. "left-back") but strip leading/trailing ones
+//   that appear when punctuation like commas is replaced with spaces
+// - Filter single-character tokens: they add index noise without search value
 export function tokenize(text: string): string[] {
   if (!text) return [];
   return text
     .toLowerCase()
-    .replace(/[^\w\säöüß-]/g, " ") // keep word chars, umlauts, hyphens
+    .replace(/[^\w\säöüß-]/g, " ")
     .split(/\s+/)
-    .map((t) => t.replace(/^-+|-+$/g, "")) // trim leading/trailing hyphens
+    .map((t) => t.replace(/^-+|-+$/g, ""))
     .filter((t) => t.length > 1 && !STOP_WORDS.has(t));
 }
 
-/**
- * Extract publication restriction tokens from suchtext.
- * e.g. "PUBLICATIONxINxGERxONLY" → "PUBLICATIONxINxGERxONLY"
- * Also extract short country codes (e.g. GER, USA, JPN, FRA, SUI, AUT)
- */
+// Restriction tokens follow a consistent machine-generated pattern: PUBLICATIONx
+// followed by alternating uppercase segments separated by "x" (e.g. INxGERxONLY).
+// Extracting these into a structured array at index-build time means the filter
+// path never has to touch the raw suchtext string — it's just an array.includes().
+// The Set deduplicates in case the same token appears twice in one suchtext.
 export function extractRestrictions(suchtext: string): string[] {
   if (!suchtext) return [];
   const matches = suchtext.match(/PUBLICATION[A-Za-z]+(?:x[A-Za-z]+)*/g);
@@ -51,8 +58,15 @@ export function extractRestrictions(suchtext: string): string[] {
   return [...new Set(matches)];
 }
 
-export type InvertedIndex = Map<string, Map<number, number>>; // token → { id → score }
+// Inverted index: maps each token to a posting list of { itemId → accumulated score }.
+// A Map<number, number> per token (rather than an array of ids) lets us accumulate
+// scores for items that appear in multiple posting lists (multi-token queries) with
+// a single .set() call instead of scanning an array.
+export type InvertedIndex = Map<string, Map<number, number>>;
 
+// Module-level singletons so preprocessing runs once per server process.
+// Next.js serverless functions cold-start per request, but in dev and on long-lived
+// hosts this cache makes subsequent requests near-instant.
 let _items: ProcessedMediaItem[] | null = null;
 let _index: InvertedIndex | null = null;
 let _credits: string[] | null = null;
@@ -64,28 +78,33 @@ function buildIndex(items: ProcessedMediaItem[]): InvertedIndex {
   function addToIndex(token: string, id: number, score: number) {
     if (!index.has(token)) index.set(token, new Map());
     const existing = index.get(token)!.get(id) ?? 0;
+    // Accumulate: an item that matches a token in both suchtext and fotografen
+    // gets a higher combined score than one that matches in only one field.
     index.get(token)!.set(id, existing + score);
   }
 
   for (const item of items) {
-    // Tokenize suchtext (weight 1.0)
+    // suchtext is the primary content field — highest weight
     for (const token of item.tokens) {
       addToIndex(token, item.id, 1.0);
     }
-    // Fotografen tokens (weight 0.5)
+    // fotografen (credit/agency) is secondary — useful when users search by
+    // agency name but shouldn't outrank a strong suchtext match
     for (const token of tokenize(item.fotografen)) {
       addToIndex(token, item.id, 0.5);
     }
-    // Bildnummer exact (weight 0.3) — indexed as a single token
+    // bildnummer is indexed as a single opaque token for exact lookup.
+    // Weight is low because it's an identifier, not a content signal.
     addToIndex(item.bildnummer, item.id, 0.3);
   }
 
   return index;
 }
 
-/**
- * Load and preprocess all items. Memoized — runs once per server process.
- */
+// Entry point for all search and filter routes.
+// Lazy-loads and preprocesses seed.json on first call, then returns the cached result.
+// All preprocessing (date parsing, tokenization, restriction extraction, index build)
+// happens here so individual request handlers stay thin.
 export function getProcessedData(): {
   items: ProcessedMediaItem[];
   index: InvertedIndex;
@@ -119,6 +138,8 @@ export function getProcessedData(): {
 
   _index = buildIndex(_items);
 
+  // Pre-sort credits alphabetically so the dropdown is consistent without
+  // needing to sort on every filter request.
   const creditSet = new Set(_items.map((i) => i.fotografen).filter(Boolean));
   _credits = [...creditSet].sort();
 
