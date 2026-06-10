@@ -2,6 +2,9 @@
 
 A lightweight, full-featured media search experience built with Next.js, TypeScript, and Tailwind CSS.
 
+**Live demo:** https://imago-search-teal.vercel.app  
+**Repository:** https://github.com/v-aru/IMAGO-Search
+
 ## Running Locally
 
 ```bash
